@@ -1,8 +1,8 @@
 # Ocean Depth Reconstruction Dataset Code
 
-This repository branch contains the code associated with the dataset-paper submission: raw source downloads, ARGO/profile alignment, GeoTIFF dataset export, the dataset loader, and IDW, LSTM, and 3D U-Net baselines. It intentionally excludes the original diffusion model, hosted dashboard/export tooling, notebooks, deployment assets, install/build metadata, and a separate docs site.
+This repository branch contains the code associated with the dataset-paper submission: raw source downloads, EN4/profile alignment, GeoTIFF dataset export, the dataset loader, and IDW, LSTM, and 3D U-Net baselines.
 
-The source tree keeps the import name `depth_recon` for compatibility with the existing scripts. Default hosted artifact links have been anonymized; replace placeholder dataset URLs in `src/depth_recon/data/dataset_creation/data_download_packaged/dataset_links.yaml` with review-safe artifact URLs.
+Default hosted artifact links have been anonymized;placeholder URLs in `src/depth_recon/data/dataset_creation/data_download_packaged/dataset_links.yaml`.
 
 ## Environment
 
@@ -62,17 +62,6 @@ Packaged download helpers read artifact URLs from `data_download_packaged/datase
   --output-dir ./data/ocean_depth_reconstruction
 ```
 
-5. Optionally assemble the anonymous review artifact folder:
-
-```bash
-/work/envs/depth/bin/python -m depth_recon.data.dataset_creation.export_aligned_argo.c_package_huggingface_aligned_argo \
-  --input-zarr ./data/ocean_depth_reconstruction/enriched_argo_profiles.zarr \
-  --raster-root ./data/ocean_depth_reconstruction/rasters \
-  --compact-argo-zarr ./data/ocean_depth_reconstruction/argo/argo_profiles_on_grid.zarr \
-  --manifest-path ./data/ocean_depth_reconstruction/manifest.yaml \
-  --masks-dir ./data/ocean_depth_reconstruction/masks \
-  --output-dir ./data/review_artifact
-```
 
 ## Baselines
 
@@ -92,10 +81,4 @@ Train a baseline by selecting `model.model_type` in the super-config or CLI over
 
 The `--scenario` selector supports `temperature`, `salinity`, and `joint`; it derives output fields, salinity loading, EO source selection, generated channels, and baseline condition channels.
 
-## Tests
 
-Run the retained test suite with:
-
-```bash
-tests/run_tests.sh
-```
