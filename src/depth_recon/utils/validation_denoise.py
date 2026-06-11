@@ -1,0 +1,1780 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from depth_recon.utils.normalizations import (
+    salinity_normalize,
+    salinity_to_plot_unit,
+    temperature_normalize,
+    temperature_to_plot_unit,
+)
+
+
+def build_capture_indices(
+    total_steps: int,
+    intermediate_step_indices: list[int] | None,
+) -> set[int]:
+    """Build and return capture indices.
+
+    Args:
+        total_steps (int): Step or timestep value.
+        intermediate_step_indices (list[int] | None): Input value.
+
+    Returns:
+        set[int]: Computed output value.
+    """
+    if total_steps < 0:
+        return set()
+    if intermediate_step_indices is None:
+        return set(range(0, int(total_steps) + 1))
+    return {
+        int(step)
+        for step in intermediate_step_indices
+        if 0 <= int(step) <= int(total_steps)
+    }
+
+
+def build_evenly_spaced_capture_steps(total_steps: int, num_frames: int) -> list[int]:
+    """Build and return evenly spaced capture steps.
+
+    Args:
+        total_steps (int): Step or timestep value.
+        num_frames (int): Size/count parameter.
+
+    Returns:
+        list[int]: List containing computed outputs.
+    """
+    if total_steps <= 0 or num_frames <= 0:
+        return []
+    # Include start-noise (step 0) and final sample (step total_steps).
+    raw = torch.linspace(0, total_steps, steps=min(total_steps + 1, num_frames))
+    rounded = raw.round().long().tolist()
+    ordered_unique: list[int] = []
+    seen: set[int] = set()
+    for step in rounded:
+        step_i = int(step)
+        if step_i in seen:
+            continue
+        seen.add(step_i)
+        ordered_unique.append(step_i)
+    return ordered_unique
+
+
+def step_to_sampler_timestep_label(
+    *,
+    step_index: int,
+    total_steps: int,
+    sampler: Any,
+) -> int:
+    """Compute step to sampler timestep label and return the result.
+
+    Args:
+        step_index (int): Input value.
+        total_steps (int): Step or timestep value.
+        sampler (Any): Sampler instance used for reverse diffusion.
+
+    Returns:
+        int: Computed scalar output.
+    """
+    if total_steps <= 0:
+        return 0
+    step_index = int(max(0, min(step_index, total_steps)))
+    if hasattr(sampler, "ddim_train_steps"):
+        ddim_train_steps = sampler.ddim_train_steps.detach().long().cpu().tolist()
+        if not ddim_train_steps:
+            return 0
+        if step_index >= total_steps:
+            return 0
+        reverse_idx = max(
+            0,
+            min(len(ddim_train_steps) - 1 - step_index, len(ddim_train_steps) - 1),
+        )
+        return int(ddim_train_steps[reverse_idx])
+    if step_index >= total_steps:
+        return 0
+    return int(max(0, total_steps - 1 - step_index))
+
+
+def log_wandb_denoise_timestep_grid(
+    *,
+    logger: Any,
+    denoise_samples: list[tuple[int, torch.Tensor]],
+    mae_samples: list[tuple[int, torch.Tensor]] | None = None,
+    total_steps: int,
+    sampler: Any,
+    conditioning_image: torch.Tensor | None = None,
+    eo_conditioning_image: torch.Tensor | None = None,
+    ground_truth: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    land_mask: torch.Tensor | None = None,
+    prefix: str = "val_imgs",
+    cmap: str = "turbo",
+    plot_unit: str = "temperature",
+    nrows: int = 4,
+    ncols: int = 4,
+    tile_size_px: int = 128,
+    tile_pad_px: int = 2,
+) -> None:
+    """Log wandb denoise timestep grid for monitoring.
+
+    Args:
+        logger (Any): Logger instance used for experiment tracking.
+        denoise_samples (list[tuple[int, torch.Tensor]]): Tensor input for the computation.
+        mae_samples (list[tuple[int, torch.Tensor]] | None): Tensor input for the computation.
+        total_steps (int): Step or timestep value.
+        sampler (Any): Sampler instance used for reverse diffusion.
+        conditioning_image (torch.Tensor | None): Tensor input for the computation.
+        eo_conditioning_image (torch.Tensor | None): Tensor input for the computation.
+        ground_truth (torch.Tensor | None): Tensor input for the computation.
+        valid_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        land_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        prefix (str): Input value.
+        cmap (str): Input value.
+        plot_unit (str): Physical variable scale to map into 0..1 plot units.
+        nrows (int): Input value.
+        ncols (int): Input value.
+        tile_size_px (int): Input value.
+        tile_pad_px (int): Input value.
+
+    Returns:
+        None: No value is returned.
+    """
+    if not denoise_samples:
+        return
+    if logger is None or not hasattr(logger, "experiment"):
+        return
+    experiment = logger.experiment
+    if not hasattr(experiment, "log"):
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    max_plots = nrows * ncols
+    tile_size_px = int(max(16, tile_size_px))
+    tile_pad_px = int(max(0, tile_pad_px))
+    canvas_h = (nrows * tile_size_px) + ((nrows - 1) * tile_pad_px)
+    canvas_w = (ncols * tile_size_px) + ((ncols - 1) * tile_pad_px)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    cmap_fn = _plot_cmap_with_black_invalid(cmap)
+    timestep_labels: list[str] = []
+
+    sorted_samples = sorted(denoise_samples, key=lambda item: int(item[0]))
+    final_step = int(sorted_samples[-1][0])
+    intermediate_candidates = [
+        (int(step_idx), sample_t)
+        for step_idx, sample_t in sorted_samples
+        if int(step_idx) != 0 and int(step_idx) != final_step
+    ]
+    if len(intermediate_candidates) >= 14:
+        pick_positions = (
+            np.linspace(0, len(intermediate_candidates) - 1, num=14).round().astype(int)
+        )
+        picked_intermediates = [intermediate_candidates[int(i)] for i in pick_positions]
+    else:
+        picked_intermediates = intermediate_candidates
+
+    plot_entries: list[tuple[str, int | None, torch.Tensor]] = []
+    if conditioning_image is not None:
+        plot_entries.append(("cond", None, conditioning_image))
+    if eo_conditioning_image is not None:
+        plot_entries.append(("eo", None, eo_conditioning_image))
+
+    max_entries_before_final = max(0, max_plots - 1)
+    for step_idx, sample_t in picked_intermediates:
+        plot_entries.append(("intermediate", step_idx, sample_t))
+        if len(plot_entries) >= max_entries_before_final:
+            break
+
+    while len(plot_entries) < max_entries_before_final and picked_intermediates:
+        plot_entries.append(
+            (
+                "intermediate",
+                int(picked_intermediates[-1][0]),
+                picked_intermediates[-1][1],
+            )
+        )
+
+    plot_entries.append(("final", final_step, sorted_samples[-1][1]))
+
+    for plot_idx in range(max_plots):
+        if plot_idx >= len(plot_entries):
+            continue
+
+        entry_kind, step_idx, sample_t = plot_entries[plot_idx]
+        # valid_mask is intentionally not applied here so generated and observed pixels
+        # remain visible together in denoising previews.
+        _ = valid_mask
+        mask_i: torch.Tensor | None = _mask_for_sample(land_mask, 0)
+        if mask_i is not None and mask_i.ndim == 3:
+            mask_i = mask_i[0]
+
+        image_t = sample_t[0, 0].detach().float()
+        if str(plot_unit).lower() == "salinity":
+            image_t = salinity_normalize(mode="denorm", tensor=image_t)
+        else:
+            image_t = temperature_normalize(mode="denorm", tensor=image_t)
+        image_plot = torch.from_numpy(
+            _physical_band_to_plot_image(image_t, mask=mask_i, plot_unit=plot_unit)
+        ).to(device=image_t.device, dtype=image_t.dtype)
+        image_plot = (
+            F.interpolate(
+                image_plot.unsqueeze(0).unsqueeze(0),
+                size=(tile_size_px, tile_size_px),
+                mode="bilinear",
+                align_corners=False,
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+        image_np = image_plot.cpu().numpy()
+        rgb = (cmap_fn(image_np)[..., :3] * 255.0).astype(np.uint8)
+
+        row = plot_idx // ncols
+        col = plot_idx % ncols
+        y0 = row * (tile_size_px + tile_pad_px)
+        x0 = col * (tile_size_px + tile_pad_px)
+        canvas[y0 : y0 + tile_size_px, x0 : x0 + tile_size_px, :] = rgb
+
+        if entry_kind == "cond":
+            timestep_labels.append(f"{plot_idx + 1}:cond")
+        elif entry_kind == "eo":
+            timestep_labels.append(f"{plot_idx + 1}:eo")
+        else:
+            sampler_t = step_to_sampler_timestep_label(
+                step_index=int(step_idx),
+                total_steps=total_steps,
+                sampler=sampler,
+            )
+            timestep_labels.append(f"{plot_idx + 1}:t={sampler_t}/s={int(step_idx)}")
+
+    if conditioning_image is not None and eo_conditioning_image is not None:
+        caption = "conditioning + eo + intermediates + final"
+    elif conditioning_image is not None:
+        caption = "conditioning + intermediates + final"
+    else:
+        caption = "intermediates + final"
+    experiment.log(
+        {
+            f"{prefix}/denoise_timestep_grid_4x4": wandb.Image(
+                canvas,
+                caption=caption,
+            )
+        }
+    )
+
+    mae_source = denoise_samples if mae_samples is None else mae_samples
+    mae_steps: list[int] = []
+    mae_vals: list[float] = []
+    if ground_truth is not None:
+        gt = ground_truth.detach().float()
+        for step_idx, sample_t in mae_source:
+            sample = sample_t.detach().float()
+            if sample.shape != gt.shape:
+                continue
+            # Intentionally unmasked: MAE is computed over the full image tensor.
+            mae = torch.mean(torch.abs(sample - gt))
+            mae_steps.append(int(step_idx))
+            mae_vals.append(float(mae.item()))
+        if mae_steps:
+            by_step: dict[int, list[float]] = {}
+            for step_i, mae_i in zip(mae_steps, mae_vals):
+                by_step.setdefault(int(step_i), []).append(float(mae_i))
+            mae_steps = sorted(by_step.keys())
+            mae_vals = [
+                float(sum(by_step[step_i]) / max(1, len(by_step[step_i])))
+                for step_i in mae_steps
+            ]
+            fig_mae, ax_mae = plt.subplots(figsize=(5, 3), dpi=150)
+            mae_line = ax_mae.plot(
+                np.asarray(mae_steps, dtype=np.int32),
+                np.asarray(mae_vals, dtype=np.float32),
+                linewidth=1.5,
+                color="#d62728",
+                marker="o",
+                markersize=2.5,
+                label=(
+                    "MAE (x0_pred vs target)"
+                    if mae_samples is not None
+                    else "MAE (intermediate vs target)"
+                ),
+            )
+            ax_mae.set_xlabel("Reverse step")
+            ax_mae.set_ylabel("MAE")
+            ax_mae.set_title("Intermediate MAE vs Reverse Diff. Step")
+            ax_mae.invert_xaxis()
+            ax_mae.grid(True, alpha=0.3, linewidth=0.5)
+            handles = list(mae_line)
+            labels = [h.get_label() for h in handles]
+            ax_mae.legend(handles, labels, loc="best")
+            ax_mae.text(
+                0.01,
+                0.02,
+                f"MAE start={mae_vals[-1]:.3f}, end={mae_vals[0]:.3f}",
+                transform=ax_mae.transAxes,
+                fontsize=8,
+                va="bottom",
+                ha="left",
+                color="#333333",
+                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=2.0),
+            )
+            fig_mae.tight_layout()
+            experiment.log({f"{prefix}/intermediate_mae_vs_step": wandb.Image(fig_mae)})
+            plt.close(fig_mae)
+
+
+def log_wandb_diffusion_schedule_profile(
+    *,
+    logger: Any,
+    sampler: Any,
+    total_steps: int,
+    prefix: str = "val_imgs",
+    eps: float = 1e-12,
+) -> None:
+    """Log wandb diffusion schedule profile for monitoring.
+
+    Args:
+        logger (Any): Logger instance used for experiment tracking.
+        sampler (Any): Sampler instance used for reverse diffusion.
+        total_steps (int): Step or timestep value.
+        prefix (str): Input value.
+        eps (float): Input value.
+
+    Returns:
+        None: No value is returned.
+    """
+    if total_steps <= 0:
+        return
+    if sampler is None:
+        return
+    if not hasattr(sampler, "alphas_cumprod") or not hasattr(sampler, "betas"):
+        return
+    if logger is None or not hasattr(logger, "experiment"):
+        return
+    experiment = logger.experiment
+    if not hasattr(experiment, "log"):
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    alpha_cumprod = sampler.alphas_cumprod.detach().float().cpu()
+    betas = sampler.betas.detach().float().cpu()
+    if alpha_cumprod.ndim != 1 or alpha_cumprod.numel() == 0:
+        return
+    if betas.ndim != 1 or betas.numel() == 0:
+        return
+
+    step_indices = list(range(max(0, int(total_steps))))
+    if not step_indices:
+        return
+
+    reverse_t_list = [
+        step_to_sampler_timestep_label(
+            step_index=step_idx,
+            total_steps=int(total_steps),
+            sampler=sampler,
+        )
+        for step_idx in step_indices
+    ]
+    reverse_t = torch.as_tensor(reverse_t_list, dtype=torch.long).clamp(
+        min=0, max=int(alpha_cumprod.numel() - 1)
+    )
+    # For DDIM, reverse steps live on a sparse subset of the training-time schedule.
+    # Reuse the same mapped timesteps in forward order so both panels describe the
+    # same trajectory rather than comparing sparse reverse steps to dense early train steps.
+    if hasattr(sampler, "ddim_train_steps"):
+        forward_t = torch.flip(reverse_t, dims=[0])
+    else:
+        forward_t = torch.arange(0, int(total_steps), dtype=torch.long).clamp(
+            min=0, max=int(alpha_cumprod.numel() - 1)
+        )
+
+    def _schedule_terms(t_idx: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Helper that computes schedule terms.
+
+        Args:
+            t_idx (torch.Tensor): Tensor input for the computation.
+
+        Returns:
+            tuple[torch.Tensor, ...]: Tuple containing computed outputs.
+        """
+        alpha_bar_t = alpha_cumprod[t_idx]
+        beta_t = betas[t_idx]
+        sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=0.0))
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=0.0))
+        snr_t = alpha_bar_t / torch.clamp(1.0 - alpha_bar_t, min=float(eps))
+        log_snr_t = torch.log10(torch.clamp(snr_t, min=float(eps)))
+
+        prev_t = torch.clamp(t_idx - 1, min=0)
+        alpha_bar_prev = alpha_cumprod[prev_t]
+        alpha_bar_prev = torch.where(
+            t_idx > 0,
+            alpha_bar_prev,
+            torch.ones_like(alpha_bar_prev),
+        )
+        beta_tilde_t = (
+            beta_t
+            * (1.0 - alpha_bar_prev)
+            / torch.clamp(1.0 - alpha_bar_t, min=float(eps))
+        )
+        beta_tilde_t = torch.clamp(beta_tilde_t, min=0.0)
+        return sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t, beta_tilde_t, log_snr_t
+
+    rev_sqrt_ab, rev_sqrt_1mab, rev_beta_tilde, rev_log_snr = _schedule_terms(reverse_t)
+    fwd_sqrt_ab, fwd_sqrt_1mab, fwd_beta_tilde, fwd_log_snr = _schedule_terms(forward_t)
+
+    x_rev = np.asarray(step_indices, dtype=np.int32)
+    x_fwd = np.asarray(step_indices, dtype=np.int32)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), dpi=150)
+
+    def _plot_panel(
+        ax: Any,
+        x_vals: np.ndarray,
+        sqrt_ab: torch.Tensor,
+        sqrt_1mab: torch.Tensor,
+        beta_tilde: torch.Tensor,
+        log_snr: torch.Tensor,
+        *,
+        title: str,
+        xlabel: str,
+    ) -> None:
+        """Helper that computes plot panel.
+
+        Args:
+            ax (Any): Input value.
+            x_vals (np.ndarray): Input value.
+            sqrt_ab (torch.Tensor): Tensor input for the computation.
+            sqrt_1mab (torch.Tensor): Tensor input for the computation.
+            beta_tilde (torch.Tensor): Tensor input for the computation.
+            log_snr (torch.Tensor): Tensor input for the computation.
+            title (str): Input value.
+            xlabel (str): Input value.
+
+        Returns:
+            None: No value is returned.
+        """
+        l_sqrt_ab = ax.plot(
+            x_vals,
+            sqrt_ab.numpy(),
+            color="#1f77b4",
+            linewidth=1.2,
+            label="sqrt(alpha_bar_t)",
+        )
+        l_sqrt_1mab = ax.plot(
+            x_vals,
+            sqrt_1mab.numpy(),
+            color="#2ca02c",
+            linewidth=1.2,
+            label="sqrt(1-alpha_bar_t)",
+        )
+        l_beta_tilde = ax.plot(
+            x_vals,
+            beta_tilde.numpy(),
+            color="#9467bd",
+            linewidth=1.2,
+            label="beta_tilde_t",
+        )
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Schedule values")
+        ax.grid(True, alpha=0.3, linewidth=0.5)
+        ax.set_title(title)
+
+        ax_log_snr = ax.twinx()
+        l_log_snr = ax_log_snr.plot(
+            x_vals,
+            log_snr.numpy(),
+            color="#d62728",
+            linewidth=1.5,
+            linestyle="--",
+            label="log10(SNR+eps)",
+        )
+        ax_log_snr.set_ylabel("log10(SNR + eps)", color="#d62728")
+        ax_log_snr.tick_params(axis="y", labelcolor="#d62728")
+
+        handles = l_sqrt_ab + l_sqrt_1mab + l_beta_tilde + l_log_snr
+        labels = [h.get_label() for h in handles]
+        ax.legend(handles, labels, loc="best")
+
+    _plot_panel(
+        axes[0],
+        x_rev,
+        rev_sqrt_ab,
+        rev_sqrt_1mab,
+        rev_beta_tilde,
+        rev_log_snr,
+        title="Reverse Process",
+        xlabel="Reverse step",
+    )
+    _plot_panel(
+        axes[1],
+        x_fwd,
+        fwd_sqrt_ab,
+        fwd_sqrt_1mab,
+        fwd_beta_tilde,
+        fwd_log_snr,
+        title="Forward Process",
+        xlabel="Forward step",
+    )
+
+    descriptor_text = (
+        "β̃ₜ  “How violent is this step?”\n"
+        "√ᾱₜ  “Is the original image still visible?”\n"
+        "√(1−ᾱₜ)  “Is noise dominating the pixels?”\n"
+        "log-SNR  “How difficult is denoising here?”"
+    )
+    fig.text(0.02, 0.01, descriptor_text, ha="left", va="bottom", fontsize=9)
+    fig.tight_layout(rect=[0.0, 0.12, 1.0, 1.0])
+    experiment.log({f"{prefix}/diffusion_schedule_vs_step": wandb.Image(fig)})
+    plt.close(fig)
+
+
+def _mask_for_sample(
+    mask: torch.Tensor | None,
+    sample_idx: int,
+) -> torch.Tensor | None:
+    """Helper that computes mask for sample.
+
+    Args:
+        mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        plot_unit (str): Physical variable scale to map into 0..1 plot units.
+        sample_idx (int): Input value.
+
+    Returns:
+        torch.Tensor | None: Tensor output produced by this call.
+    """
+    if mask is None:
+        return None
+    if mask.ndim == 4:
+        sample_mask = mask[sample_idx]
+        if sample_mask.size(0) == 1:
+            return sample_mask[0]
+        # Keep per-band masks so caller can pick the plotted channel explicitly.
+        return sample_mask
+    if mask.ndim == 3:
+        return mask[sample_idx]
+    if mask.ndim == 2:
+        return mask
+    return None
+
+
+def _plot_band_image(
+    tensor: torch.Tensor,
+    sample_idx: int,
+    *,
+    band_idx: int = 0,
+    mask: torch.Tensor | None = None,
+    plot_unit: str = "temperature",
+) -> np.ndarray:
+    """Helper that computes plot band image.
+
+    Args:
+        tensor (torch.Tensor): Tensor input for the computation.
+        sample_idx (int): Input value.
+        band_idx (int): Input value.
+        mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        plot_unit (str): Physical variable scale to map into 0..1 plot units.
+
+    Returns:
+        np.ndarray: Computed output value.
+    """
+    if tensor.ndim == 4:
+        channel_idx = int(max(0, min(int(band_idx), int(tensor.size(1)) - 1)))
+        image_t = tensor[sample_idx, channel_idx].detach().float()
+    elif tensor.ndim == 3:
+        image_t = tensor[sample_idx].detach().float()
+    elif tensor.ndim == 2:
+        image_t = tensor.detach().float()
+    else:
+        raise RuntimeError(
+            f"Expected tensor ndim in {{2,3,4}} for plotting, got {int(tensor.ndim)}."
+        )
+    return _physical_band_to_plot_image(image_t, mask=mask, plot_unit=plot_unit)
+
+
+def _invalid_plot_fill_value(plot_unit: str) -> float:
+    """Return the plotted fill value for invalid pixels."""
+    if str(plot_unit).lower() == "salinity":
+        return -1.0
+    return 0.0
+
+
+def _plot_cmap_with_black_invalid(cmap: str) -> Any:
+    """Return a colormap that renders under-range invalid pixels as black."""
+    cmap_obj = cm.get_cmap(cmap).copy()
+    cmap_obj.set_under("black")
+    cmap_obj.set_bad("black")
+    return cmap_obj
+
+
+def _physical_band_to_plot_image(
+    image_t: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    plot_unit: str = "temperature",
+) -> np.ndarray:
+    """Convert one denormalized physical band into a shared plot color scale."""
+    image_t = image_t.detach().float()
+    finite_mask = torch.isfinite(image_t)
+    if mask is not None:
+        finite_mask = finite_mask & (mask > 0.5).to(device=image_t.device)
+    if str(plot_unit).lower() == "salinity":
+        image_plot = salinity_to_plot_unit(image_t, tensor_is_normalized=False)
+    else:
+        # Use one global Celsius plotting range so EO, GLORYS, and reconstructions share colors.
+        image_plot = temperature_to_plot_unit(image_t, tensor_is_normalized=False)
+    invalid_value = _invalid_plot_fill_value(plot_unit)
+    image_plot = torch.where(
+        finite_mask,
+        image_plot,
+        torch.full_like(image_plot, float(invalid_value)),
+    )
+    return image_plot.cpu().numpy().astype(np.float32)
+
+
+def _collapse_valid_mask_to_spatial(mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Return a 2D mask where any depth channel contains a valid observation."""
+    if mask is None:
+        return None
+    mask_bool = mask.detach() > 0.5
+    if mask_bool.ndim == 3:
+        return mask_bool.any(dim=0)
+    if mask_bool.ndim == 2:
+        return mask_bool
+    return None
+
+
+def _plot_any_depth_observation_image(
+    tensor: torch.Tensor,
+    sample_idx: int,
+    *,
+    valid_mask_i: torch.Tensor | None,
+    land_band: torch.Tensor | None = None,
+    band_idx: int = 0,
+    plot_unit: str = "temperature",
+) -> np.ndarray:
+    """Render sparse input pixels wherever any depth channel is observed."""
+    if tensor.ndim != 4 or valid_mask_i is None or valid_mask_i.ndim != 3:
+        return _plot_band_image(
+            tensor,
+            sample_idx,
+            band_idx=band_idx,
+            mask=land_band,
+            plot_unit=plot_unit,
+        )
+
+    sample_t = tensor[sample_idx].detach().float()
+    if sample_t.shape != valid_mask_i.shape:
+        return _plot_band_image(
+            tensor,
+            sample_idx,
+            band_idx=band_idx,
+            mask=land_band,
+            plot_unit=plot_unit,
+        )
+
+    observed = (valid_mask_i > 0.5).to(device=sample_t.device)
+    spatial_observed = observed.any(dim=0)
+    if not bool(torch.any(spatial_observed)):
+        return _plot_band_image(
+            tensor,
+            sample_idx,
+            band_idx=band_idx,
+            mask=land_band,
+            plot_unit=plot_unit,
+        )
+
+    # Pick the shallowest observed channel at each profile location so the input panel
+    # shows every ARGO profile once without changing per-depth metric masks.
+    first_observed_depth = observed.float().argmax(dim=0).long()
+    image_t = torch.gather(sample_t, 0, first_observed_depth.unsqueeze(0)).squeeze(0)
+    plot_mask = spatial_observed
+    if land_band is not None:
+        land_bool = (land_band > 0.5).to(device=sample_t.device)
+        if land_bool.shape == plot_mask.shape:
+            plot_mask = plot_mask & land_bool
+    return _physical_band_to_plot_image(image_t, mask=plot_mask, plot_unit=plot_unit)
+
+
+def average_observed_argo_pixels_per_image(
+    valid_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return the average number of spatial pixels with ARGO observations."""
+    if valid_mask is None:
+        return torch.zeros((), dtype=torch.float32)
+    observed = valid_mask > 0.5
+    if observed.ndim == 4:
+        # A profile can span many depth bands; count each spatial location once.
+        observed = observed.any(dim=1)
+    elif observed.ndim == 2:
+        observed = observed.unsqueeze(0)
+    elif observed.ndim != 3:
+        return torch.zeros((), dtype=torch.float32, device=valid_mask.device)
+    observed_flat = observed.float().reshape(int(observed.size(0)), -1)
+    return observed_flat.sum(dim=1).mean()
+
+
+def _resize_input_plot_image(image: np.ndarray, *, size: int = 64) -> np.ndarray:
+    """Resize the sparse input panel so observed ARGO pixels remain visible."""
+    image_np = np.asarray(image, dtype=np.float32)
+    if image_np.ndim != 2 or tuple(image_np.shape) == (int(size), int(size)):
+        return image_np
+    image_t = torch.from_numpy(image_np).unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(image_t, size=(int(size), int(size)), mode="nearest")
+    return resized.squeeze(0).squeeze(0).numpy().astype(np.float32, copy=False)
+
+
+def log_wandb_conditional_reconstruction_grid(
+    *,
+    logger: Any,
+    x: torch.Tensor,
+    y: torch.Tensor | None = None,
+    y_hat: torch.Tensor,
+    y_target: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    land_mask: torch.Tensor | None = None,
+    eo: torch.Tensor | None = None,
+    prefix: str = "val_imgs",
+    image_key: str = "x_y_full_reconstruction",
+    cmap: str = "turbo",
+    show_valid_mask_panel: bool = True,
+    plot_unit: str = "temperature",
+    error_metric_prefix: str = "val_absolute_band_error",
+    error_metric_unit: str = "deg",
+    error_metric_label: str = "L1 (deg)",
+    error_metric_title: str = "Generated-Pixel L1 by Band",
+) -> None:
+    """Log wandb conditional reconstruction grid for monitoring.
+
+    Args:
+        logger (Any): Logger instance used for experiment tracking.
+        x (torch.Tensor): Tensor input for the computation.
+        y (torch.Tensor | None): Tensor input for the computation.
+        y_hat (torch.Tensor): Tensor input for the computation.
+        y_target (torch.Tensor): Tensor input for the computation.
+        valid_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        land_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        eo (torch.Tensor | None): Tensor input for the computation.
+        prefix (str): Input value.
+        image_key (str): Input value.
+        cmap (str): Input value.
+        show_valid_mask_panel (bool): Controls whether valid mask is shown as a panel.
+        plot_unit (str): Physical variable scale to map into 0..1 plot units.
+        error_metric_prefix (str): W&B namespace for per-band error metrics.
+        error_metric_unit (str): Unit suffix used in per-band metric names.
+        error_metric_label (str): Series label for the compact W&B line chart.
+        error_metric_title (str): Title for the compact W&B line chart.
+
+    Returns:
+        None: No value is returned.
+    """
+    if logger is None or not hasattr(logger, "experiment"):
+        return
+    experiment = logger.experiment
+    if not hasattr(experiment, "log"):
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    num_to_plot = min(5, int(x.size(0)))
+    if num_to_plot <= 0:
+        return
+    # Show one representative band per sample by default. Plotting all bands can
+    # look like repeated images when channels are highly correlated.
+    channels_to_plot = 1
+
+    fig = None
+    try:
+        input_avg_count: float | None = None
+        if valid_mask is not None:
+            valid_mask_for_count = valid_mask
+            if valid_mask.ndim >= 3:
+                valid_mask_for_count = valid_mask[:num_to_plot]
+            input_avg_count = float(
+                average_observed_argo_pixels_per_image(valid_mask_for_count)
+                .detach()
+                .cpu()
+                .item()
+            )
+        total_rows = num_to_plot * channels_to_plot
+        show_valid_panel = bool(show_valid_mask_panel and valid_mask is not None)
+        show_target_panel = True
+        if y is not None and y_target.shape == y.shape:
+            # Avoid duplicating the GLORYS panel in the common production validation path.
+            show_target_panel = not torch.equal(y_target.detach(), y.detach())
+        ncols = 2
+        if y is not None:
+            ncols += 1
+        if eo is not None:
+            ncols += 1
+        if show_target_panel:
+            ncols += 1
+        if show_valid_panel:
+            ncols += 1
+        if land_mask is not None:
+            ncols += 1
+        fig, axes = plt.subplots(
+            total_rows, ncols, figsize=(4 * ncols, 2.8 * total_rows), squeeze=False
+        )
+        image_cmap = _plot_cmap_with_black_invalid(cmap)
+        invalid_value = _invalid_plot_fill_value(plot_unit)
+
+        for i in range(num_to_plot):
+            valid_mask_i = _mask_for_sample(valid_mask, i)
+            land_mask_i = _mask_for_sample(land_mask, i)
+            for band_idx in range(channels_to_plot):
+                row_idx = (i * channels_to_plot) + band_idx
+                valid_band = valid_mask_i
+                if valid_band is not None and valid_band.ndim == 3:
+                    valid_band = valid_band[min(band_idx, int(valid_band.size(0)) - 1)]
+                land_band = land_mask_i
+                if land_band is not None and land_band.ndim == 3:
+                    land_band = land_band[min(band_idx, int(land_band.size(0)) - 1)]
+
+                spatial_valid_band = _collapse_valid_mask_to_spatial(valid_mask_i)
+                x_img = _plot_any_depth_observation_image(
+                    x,
+                    i,
+                    valid_mask_i=valid_mask_i,
+                    land_band=land_band,
+                    band_idx=band_idx,
+                    plot_unit=plot_unit,
+                )
+                y_hat_img = _plot_band_image(
+                    y_hat, i, band_idx=band_idx, mask=land_band, plot_unit=plot_unit
+                )
+                y_target_img = _plot_band_image(
+                    y_target,
+                    i,
+                    band_idx=band_idx,
+                    mask=land_band,
+                    plot_unit=plot_unit,
+                )
+                if valid_band is not None:
+                    # Keep full-panel x visualization sparse while marking any-depth profiles.
+                    valid_for_plot = spatial_valid_band
+                    if valid_for_plot is None:
+                        valid_for_plot = valid_band
+                    valid_np = valid_for_plot.detach().cpu().numpy() > 0.5
+                    x_img[~valid_np] = invalid_value
+                if y is not None:
+                    y_img = _plot_band_image(
+                        y, i, band_idx=band_idx, mask=land_band, plot_unit=plot_unit
+                    )
+                else:
+                    y_img = None
+                if land_band is not None:
+                    # Fill land pixels right before rendering full reconstruction panels.
+                    ocean_np = land_band.detach().cpu().numpy() > 0.5
+                    x_img[~ocean_np] = invalid_value
+                    if y_img is not None:
+                        y_img[~ocean_np] = invalid_value
+                    y_hat_img[~ocean_np] = invalid_value
+                    y_target_img[~ocean_np] = invalid_value
+
+                col = 0
+                x_img = _resize_input_plot_image(x_img)
+                axes[row_idx, col].imshow(x_img, cmap=image_cmap, vmin=0.0, vmax=1.0)
+                axes[row_idx, col].set_axis_off()
+                if row_idx == 0:
+                    title = "Input"
+                    if input_avg_count is not None:
+                        title = f"Input (avg {input_avg_count:.1f} ARGO px/img)"
+                    axes[row_idx, col].set_title(title)
+                col += 1
+
+                if y_img is not None:
+                    axes[row_idx, col].imshow(
+                        y_img, cmap=image_cmap, vmin=0.0, vmax=1.0
+                    )
+                    axes[row_idx, col].set_axis_off()
+                    if row_idx == 0:
+                        axes[row_idx, col].set_title("GLORYS")
+                    col += 1
+
+                if eo is not None:
+                    eo_img = _plot_band_image(eo, i, band_idx=band_idx, mask=land_band)
+                    if land_band is not None:
+                        ocean_np = land_band.detach().cpu().numpy() > 0.5
+                        eo_img[~ocean_np] = invalid_value
+                    axes[row_idx, col].imshow(
+                        eo_img, cmap=image_cmap, vmin=0.0, vmax=1.0
+                    )
+                    axes[row_idx, col].set_axis_off()
+                    if row_idx == 0:
+                        axes[row_idx, col].set_title("EO condition")
+                    col += 1
+
+                axes[row_idx, col].imshow(
+                    y_hat_img, cmap=image_cmap, vmin=0.0, vmax=1.0
+                )
+                axes[row_idx, col].set_axis_off()
+                if row_idx == 0:
+                    axes[row_idx, col].set_title("Reconstruction")
+                col += 1
+
+                if show_target_panel:
+                    axes[row_idx, col].imshow(
+                        y_target_img, cmap=image_cmap, vmin=0.0, vmax=1.0
+                    )
+                    axes[row_idx, col].set_axis_off()
+                    if row_idx == 0:
+                        axes[row_idx, col].set_title("Target")
+                    col += 1
+
+                if show_valid_panel:
+                    valid_panel = spatial_valid_band
+                    if valid_panel is None:
+                        valid_panel = valid_band
+                    if valid_panel is not None:
+                        axes[row_idx, col].imshow(
+                            valid_panel.detach().float().cpu().numpy(),
+                            cmap="gray",
+                            vmin=0.0,
+                            vmax=1.0,
+                        )
+                        axes[row_idx, col].set_axis_off()
+                        if row_idx == 0:
+                            axes[row_idx, col].set_title("Valid mask (any depth)")
+                    col += 1
+
+                if land_mask is not None and land_band is not None:
+                    axes[row_idx, col].imshow(
+                        land_band.detach().float().cpu().numpy(),
+                        cmap="gray",
+                        vmin=0.0,
+                        vmax=1.0,
+                    )
+                    axes[row_idx, col].set_axis_off()
+                    if row_idx == 0:
+                        axes[row_idx, col].set_title("Land mask")
+
+                axes[row_idx, 0].set_ylabel(f"s{i} b{band_idx}", rotation=90)
+
+        fig.tight_layout()
+        experiment.log({f"{prefix}/{image_key}": wandb.Image(fig)})
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+    # Log denormalized reconstruction L1 (in degrees) over generated pixels only.
+    try:
+        y_hat_t = y_hat.detach().float()
+        y_target_t = y_target.detach().float()
+        if y_hat_t.ndim == 3:
+            y_hat_t = y_hat_t.unsqueeze(1)
+        if y_target_t.ndim == 3:
+            y_target_t = y_target_t.unsqueeze(1)
+        if y_hat_t.ndim != 4 or y_target_t.ndim != 4:
+            return
+        if y_hat_t.shape != y_target_t.shape:
+            return
+
+        if valid_mask is None:
+            return
+        generated_mask = (valid_mask.detach().float() <= 0.5).to(device=y_hat_t.device)
+        if generated_mask.ndim == 3:
+            generated_mask = generated_mask.unsqueeze(1)
+        if generated_mask.ndim != 4:
+            return
+        if (
+            generated_mask.shape[0] != y_hat_t.shape[0]
+            or generated_mask.shape[2:] != y_hat_t.shape[2:]
+        ):
+            return
+        if generated_mask.size(1) == 1 and y_hat_t.size(1) > 1:
+            generated_mask = generated_mask.expand(-1, y_hat_t.size(1), -1, -1)
+        elif generated_mask.size(1) != y_hat_t.size(1):
+            return
+
+        if land_mask is not None:
+            ocean_mask = (land_mask.detach().float() > 0.5).to(device=y_hat_t.device)
+            if ocean_mask.ndim == 3:
+                ocean_mask = ocean_mask.unsqueeze(1)
+            if ocean_mask.ndim != 4:
+                return
+            if (
+                ocean_mask.shape[0] != y_hat_t.shape[0]
+                or ocean_mask.shape[2:] != y_hat_t.shape[2:]
+            ):
+                return
+            if ocean_mask.size(1) == 1 and y_hat_t.size(1) > 1:
+                ocean_mask = ocean_mask.expand(-1, y_hat_t.size(1), -1, -1)
+            elif ocean_mask.size(1) != y_hat_t.size(1):
+                return
+            generated_mask = generated_mask * ocean_mask
+
+        abs_diff = torch.abs(y_hat_t - y_target_t)
+        numer_per_band = (abs_diff * generated_mask).sum(dim=(0, 2, 3))
+        denom_per_band = generated_mask.sum(dim=(0, 2, 3))
+        valid_bands = denom_per_band > 0
+        if not bool(torch.any(valid_bands)):
+            return
+
+        l1_per_band = torch.zeros_like(numer_per_band)
+        l1_per_band[valid_bands] = (
+            numer_per_band[valid_bands] / denom_per_band[valid_bands]
+        )
+
+        # Keep per-band error metrics out of the image namespace in W&B.
+        metric_prefix = str(error_metric_prefix)
+        metric_unit = str(error_metric_unit).strip().lower() or "unit"
+        l1_logs: dict[str, float] = {}
+        band_x: list[int] = []
+        band_y: list[float] = []
+        for band_idx in range(int(l1_per_band.numel())):
+            if not bool(valid_bands[band_idx].item()):
+                continue
+            band_val = float(l1_per_band[band_idx].item())
+            l1_logs[
+                f"{metric_prefix}/recon_l1_generated_{metric_unit}_band_{int(band_idx)}"
+            ] = band_val
+            band_x.append(int(band_idx))
+            band_y.append(band_val)
+
+        if not l1_logs:
+            return
+        # One scalar per depth level for standard W&B metric tracking.
+        experiment.log(l1_logs)
+        # Optional compact view: all bands in a single plot panel for this validation pass.
+        experiment.log(
+            {
+                f"{metric_prefix}/recon_l1_generated_{metric_unit}_by_band": wandb.plot.line_series(
+                    xs=band_x,
+                    ys=[band_y],
+                    keys=[str(error_metric_label)],
+                    title=str(error_metric_title),
+                    xname="Band index",
+                )
+            }
+        )
+    except Exception:
+        # Auxiliary scalar logging must never block validation image logging.
+        pass
+
+
+def log_wandb_depth_level_reconstruction_grid(
+    *,
+    logger: Any,
+    y_hat: torch.Tensor,
+    y_target: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eo: torch.Tensor | None = None,
+    land_mask: torch.Tensor | None = None,
+    prefix: str = "val_imgs",
+    image_key: str = "depth_level_reconstruction_grid",
+    band_indices: tuple[int, ...] = (0, 1, 3),
+    sample_idx: int = 0,
+    cmap: str = "turbo",
+) -> None:
+    """Log wandb depth-level reconstruction grid for monitoring.
+
+    Args:
+        logger (Any): Logger instance used for experiment tracking.
+        y_hat (torch.Tensor): Tensor input for the computation.
+        y_target (torch.Tensor): Tensor input for the computation.
+        valid_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        eo (torch.Tensor | None): Tensor input for the computation.
+        land_mask (torch.Tensor | None): Mask tensor controlling valid or known pixels.
+        prefix (str): Input value.
+        image_key (str): Input value.
+        band_indices (tuple[int, ...]): Input value.
+        sample_idx (int): Input value.
+        cmap (str): Input value.
+
+    Returns:
+        None: No value is returned.
+    """
+    if logger is None or not hasattr(logger, "experiment"):
+        return
+    experiment = logger.experiment
+    if not hasattr(experiment, "log"):
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    if int(y_hat.size(0)) <= 0 or int(y_target.size(0)) <= 0:
+        return
+    if int(y_hat.size(0)) != int(y_target.size(0)):
+        return
+    if not band_indices:
+        return
+
+    sample_i = int(max(0, min(int(sample_idx), int(y_hat.size(0)) - 1)))
+    available_bands = int(y_hat.size(1)) if y_hat.ndim == 4 else 1
+    max_band_idx = max(0, available_bands - 1)
+
+    fig = None
+    try:
+        fig, axes = plt.subplots(
+            len(band_indices),
+            4,
+            figsize=(16, 2.8 * len(band_indices)),
+            squeeze=False,
+        )
+        valid_mask_i = _mask_for_sample(valid_mask, sample_i)
+        land_mask_i = _mask_for_sample(land_mask, sample_i)
+
+        for row_idx, requested_band_idx in enumerate(band_indices):
+            # Clamp requested indices so this view still renders for any depth count.
+            band_idx = int(max(0, min(int(requested_band_idx), max_band_idx)))
+            valid_band = valid_mask_i
+            if valid_band is not None and valid_band.ndim == 3:
+                valid_band = valid_band[min(band_idx, int(valid_band.size(0)) - 1)]
+            land_band = land_mask_i
+            if land_band is not None and land_band.ndim == 3:
+                land_band = land_band[min(band_idx, int(land_band.size(0)) - 1)]
+
+            recon_img = _plot_band_image(
+                y_hat, sample_i, band_idx=band_idx, mask=land_band
+            )
+            target_img = _plot_band_image(
+                y_target, sample_i, band_idx=band_idx, mask=land_band
+            )
+            if eo is not None:
+                eo_img = _plot_band_image(
+                    eo, sample_i, band_idx=band_idx, mask=land_band
+                )
+            else:
+                eo_img = np.zeros_like(recon_img, dtype=np.float32)
+            if valid_band is not None:
+                valid_img = valid_band.detach().float().cpu().numpy()
+            else:
+                valid_img = np.zeros_like(recon_img, dtype=np.float32)
+
+            if land_band is not None:
+                ocean_np = land_band.detach().cpu().numpy() > 0.5
+                eo_img[~ocean_np] = 0.0
+                recon_img[~ocean_np] = 0.0
+                target_img[~ocean_np] = 0.0
+
+            axes[row_idx, 0].imshow(valid_img, cmap="gray", vmin=0.0, vmax=1.0)
+            axes[row_idx, 0].set_axis_off()
+            axes[row_idx, 1].imshow(eo_img, cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[row_idx, 1].set_axis_off()
+            axes[row_idx, 2].imshow(recon_img, cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[row_idx, 2].set_axis_off()
+            axes[row_idx, 3].imshow(target_img, cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[row_idx, 3].set_axis_off()
+
+            if row_idx == 0:
+                axes[row_idx, 0].set_title("Valid mask")
+                axes[row_idx, 1].set_title("EO condition")
+                axes[row_idx, 2].set_title("Reconstruction")
+                axes[row_idx, 3].set_title("Ground truth")
+
+            if int(requested_band_idx) == band_idx:
+                axes[row_idx, 0].set_ylabel(f"band {band_idx}", rotation=90)
+            else:
+                axes[row_idx, 0].set_ylabel(
+                    f"band {int(requested_band_idx)} -> {band_idx}",
+                    rotation=90,
+                )
+
+        fig.tight_layout()
+        experiment.log({f"{prefix}/{image_key}": wandb.Image(fig)})
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+def _resolve_profile_depth_axis(
+    *,
+    profile_size: int,
+    depth_axis: np.ndarray | None = None,
+) -> tuple[np.ndarray, str]:
+    """Return the plotting depth axis for one vertical profile."""
+    if depth_axis is None:
+        return np.arange(int(profile_size), dtype=np.int32), "GLORYS depth band"
+
+    depth_axis_np = np.asarray(depth_axis, dtype=np.float64).reshape(-1)
+    if int(depth_axis_np.size) != int(profile_size):
+        raise ValueError(
+            "depth_axis must match the profile depth dimension: "
+            f"{int(depth_axis_np.size)} != {int(profile_size)}"
+        )
+    return depth_axis_np, "Depth (m)"
+
+
+def _profile_depth_plot_limits(
+    *,
+    depth_values: np.ndarray,
+    x_profile: np.ndarray,
+    y_hat_profile: np.ndarray,
+    y_target_profile: np.ndarray,
+    observed_profile: np.ndarray,
+) -> tuple[float, float]:
+    """Clip profile plots to the deepest actually plotted level plus light headroom."""
+    depth_values_np = np.asarray(depth_values, dtype=np.float64).reshape(-1)
+    observed_profile_np = np.asarray(observed_profile, dtype=bool).reshape(-1)
+    plotted_mask = (
+        (np.isfinite(np.asarray(y_hat_profile, dtype=np.float64).reshape(-1)))
+        | (np.isfinite(np.asarray(y_target_profile, dtype=np.float64).reshape(-1)))
+        | (
+            observed_profile_np
+            & np.isfinite(np.asarray(x_profile, dtype=np.float64).reshape(-1))
+        )
+    ) & np.isfinite(depth_values_np)
+    if bool(np.any(plotted_mask)):
+        plotted_depth_max = float(np.nanmax(depth_values_np[plotted_mask]))
+    else:
+        plotted_depth_max = float(np.nanmax(depth_values_np))
+
+    # Add a small buffer below the deepest visible level so shallow samples do not
+    # waste the whole lower half of the axis, while still avoiding a cramped edge.
+    depth_headroom = max(5.0, 0.08 * max(plotted_depth_max, 1.0))
+    return 0.0, plotted_depth_max + depth_headroom
+
+
+def plot_glorys_profile_comparison_axis(
+    ax: Any,
+    *,
+    x_profile: np.ndarray,
+    y_hat_profile: np.ndarray,
+    y_target_profile: np.ndarray,
+    observed_profile: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    ostia_sst_c: float | None = None,
+    title: str | None = None,
+    show_legend: bool = False,
+    profile_x_label: str = "Temperature (deg C)",
+    surface_context_label: str = "OSTIA SST",
+) -> None:
+    """Draw one validation-style profile comparison axis."""
+    x_profile_np = np.asarray(x_profile, dtype=np.float64).reshape(-1)
+    y_hat_profile_np = np.asarray(y_hat_profile, dtype=np.float64).reshape(-1)
+    y_target_profile_np = np.asarray(y_target_profile, dtype=np.float64).reshape(-1)
+    observed_profile_np = np.asarray(observed_profile, dtype=bool).reshape(-1)
+    if (
+        x_profile_np.size != y_hat_profile_np.size
+        or x_profile_np.size != y_target_profile_np.size
+        or x_profile_np.size != observed_profile_np.size
+    ):
+        raise ValueError("All profile inputs must share the same depth dimension.")
+
+    depth_values, depth_label = _resolve_profile_depth_axis(
+        profile_size=int(y_target_profile_np.size),
+        depth_axis=depth_axis,
+    )
+    depth_top, depth_bottom = _profile_depth_plot_limits(
+        depth_values=depth_values,
+        x_profile=x_profile_np,
+        y_hat_profile=y_hat_profile_np,
+        y_target_profile=y_target_profile_np,
+        observed_profile=observed_profile_np,
+    )
+    ax.plot(
+        y_target_profile_np,
+        depth_values,
+        label="GLORYS",
+        color="black",
+        linewidth=2.0,
+    )
+    ax.plot(
+        y_hat_profile_np,
+        depth_values,
+        label="Prediction",
+        color="tab:orange",
+        linewidth=1.8,
+    )
+    if bool(np.any(observed_profile_np)):
+        # Keep the sparse conditioning profile visually identical to validation logging.
+        ax.plot(
+            x_profile_np[observed_profile_np],
+            depth_values[observed_profile_np],
+            label="ARGO Sample",
+            color="tab:blue",
+            marker="o",
+            linewidth=1.4,
+            markersize=3.5,
+        )
+    if ostia_sst_c is not None and np.isfinite(float(ostia_sst_c)):
+        ax.scatter(
+            [float(ostia_sst_c)],
+            [0.0],
+            label=surface_context_label,
+            color="tab:green",
+            marker="D",
+            s=42,
+            zorder=5,
+        )
+    # Keep shallow water at the top regardless of any other subplot settings.
+    ax.set_ylim(depth_bottom, depth_top)
+    ax.margins(y=0.0)
+    ax.set_xlabel(str(profile_x_label))
+    ax.set_ylabel(depth_label)
+    if title is not None:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    if show_legend:
+        ax.legend(loc="best")
+
+
+def plot_glorys_profile_error_axis(
+    ax: Any,
+    *,
+    x_profile: np.ndarray,
+    y_hat_profile: np.ndarray,
+    y_target_profile: np.ndarray,
+    observed_profile: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    title: str | None = None,
+    show_legend: bool = False,
+    error_x_label: str = "Absolute error (deg C)",
+) -> None:
+    """Draw one absolute-error-vs-depth axis for prediction errors."""
+    x_profile_np = np.asarray(x_profile, dtype=np.float64).reshape(-1)
+    y_hat_profile_np = np.asarray(y_hat_profile, dtype=np.float64).reshape(-1)
+    y_target_profile_np = np.asarray(y_target_profile, dtype=np.float64).reshape(-1)
+    observed_profile_np = np.asarray(observed_profile, dtype=bool).reshape(-1)
+    if (
+        x_profile_np.size != y_hat_profile_np.size
+        or x_profile_np.size != y_target_profile_np.size
+        or x_profile_np.size != observed_profile_np.size
+    ):
+        raise ValueError("All profile inputs must share the same depth dimension.")
+
+    depth_values, depth_label = _resolve_profile_depth_axis(
+        profile_size=int(y_target_profile_np.size),
+        depth_axis=depth_axis,
+    )
+    depth_top, depth_bottom = _profile_depth_plot_limits(
+        depth_values=depth_values,
+        x_profile=x_profile_np,
+        y_hat_profile=y_hat_profile_np,
+        y_target_profile=y_target_profile_np,
+        observed_profile=observed_profile_np,
+    )
+    pred_vs_glorys_mask = np.isfinite(y_hat_profile_np) & np.isfinite(
+        y_target_profile_np
+    )
+    if bool(np.any(pred_vs_glorys_mask)):
+        ax.plot(
+            np.abs(
+                y_hat_profile_np[pred_vs_glorys_mask]
+                - y_target_profile_np[pred_vs_glorys_mask]
+            ),
+            depth_values[pred_vs_glorys_mask],
+            label="|Prediction - GLORYS|",
+            color="black",
+            linewidth=1.8,
+        )
+
+    # Restrict the ARGO error trace to actually observed levels so NaN-masked
+    # placeholders from sparse profiles never show up as fake low error.
+    pred_vs_argo_mask = (
+        observed_profile_np & np.isfinite(x_profile_np) & np.isfinite(y_hat_profile_np)
+    )
+    if bool(np.any(pred_vs_argo_mask)):
+        ax.plot(
+            np.abs(
+                y_hat_profile_np[pred_vs_argo_mask] - x_profile_np[pred_vs_argo_mask]
+            ),
+            depth_values[pred_vs_argo_mask],
+            label="|Prediction - ARGO|",
+            color="tab:blue",
+            marker="o",
+            linewidth=1.4,
+            markersize=3.5,
+        )
+
+    # Match the main profile panel: 0 m stays at the top and deeper values go down.
+    ax.set_ylim(depth_bottom, depth_top)
+    ax.margins(y=0.0)
+    ax.set_xlabel(str(error_x_label))
+    ax.set_ylabel(depth_label)
+    if title is not None:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    if show_legend:
+        ax.legend(loc="best")
+
+
+def _depth_plot_limits_for_series(
+    *,
+    depth_values: np.ndarray,
+    series: list[np.ndarray],
+) -> tuple[float, float]:
+    """Clip depth plots to the deepest finite level across the provided traces."""
+    depth_values_np = np.asarray(depth_values, dtype=np.float64).reshape(-1)
+    plotted_mask = np.isfinite(depth_values_np)
+    if bool(np.any(plotted_mask)):
+        finite_series_mask = np.zeros(depth_values_np.shape, dtype=bool)
+        for values in series:
+            finite_series_mask |= np.isfinite(
+                np.asarray(values, dtype=np.float64).reshape(-1)
+            )
+        plotted_mask &= finite_series_mask
+    if bool(np.any(plotted_mask)):
+        plotted_depth_max = float(np.nanmax(depth_values_np[plotted_mask]))
+    else:
+        plotted_depth_max = float(np.nanmax(depth_values_np))
+
+    depth_headroom = max(5.0, 0.08 * max(plotted_depth_max, 1.0))
+    return 0.0, plotted_depth_max + depth_headroom
+
+
+def plot_average_glorys_profile_error_axis(
+    ax: Any,
+    *,
+    mean_abs_error_prediction_vs_glorys: np.ndarray,
+    mean_abs_error_prediction_vs_argo: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    title: str | None = None,
+    show_legend: bool = False,
+) -> None:
+    """Draw one pooled absolute-error-vs-depth axis for the validation summary."""
+    glorys_error_np = np.asarray(
+        mean_abs_error_prediction_vs_glorys, dtype=np.float64
+    ).reshape(-1)
+    argo_error_np = np.asarray(
+        mean_abs_error_prediction_vs_argo, dtype=np.float64
+    ).reshape(-1)
+    if glorys_error_np.size != argo_error_np.size:
+        raise ValueError("Average error traces must share the same depth dimension.")
+
+    depth_values, depth_label = _resolve_profile_depth_axis(
+        profile_size=int(glorys_error_np.size),
+        depth_axis=depth_axis,
+    )
+    depth_top, depth_bottom = _depth_plot_limits_for_series(
+        depth_values=depth_values,
+        series=[glorys_error_np, argo_error_np],
+    )
+    if bool(np.any(np.isfinite(glorys_error_np))):
+        ax.plot(
+            glorys_error_np,
+            depth_values,
+            label="|Prediction - GLORYS|",
+            color="black",
+            linewidth=1.8,
+        )
+    if bool(np.any(np.isfinite(argo_error_np))):
+        ax.plot(
+            argo_error_np,
+            depth_values,
+            label="|Prediction - ARGO|",
+            color="tab:blue",
+            marker="o",
+            linewidth=1.4,
+            markersize=3.5,
+        )
+
+    ax.set_ylim(depth_bottom, depth_top)
+    ax.margins(y=0.0)
+    ax.set_xlabel("Absolute error (deg C)")
+    ax.set_ylabel(depth_label)
+    if title is not None:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    if show_legend:
+        ax.legend(loc="best")
+
+
+def save_glorys_profile_comparison_plot(
+    *,
+    output_path: str | Path,
+    x_profile: np.ndarray,
+    y_hat_profile: np.ndarray,
+    y_target_profile: np.ndarray,
+    observed_profile: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    ostia_sst_c: float | None = None,
+    title: str | None = None,
+    figure_title: str | None = None,
+    profile_x_label: str = "Temperature (deg C)",
+    error_x_label: str = "Absolute error (deg C)",
+    surface_context_label: str = "OSTIA SST",
+    dpi: int = 180,
+    webp_quality: int = 95,
+) -> Path:
+    """Save one validation-style profile comparison plot to disk."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = None
+    try:
+        fig, ax = plt.subplots(
+            1,
+            2,
+            figsize=(10.125, 8.1),
+            squeeze=False,
+            gridspec_kw={"width_ratios": [1.25, 1.0]},
+        )
+        plot_glorys_profile_comparison_axis(
+            ax[0, 0],
+            x_profile=x_profile,
+            y_hat_profile=y_hat_profile,
+            y_target_profile=y_target_profile,
+            observed_profile=observed_profile,
+            depth_axis=depth_axis,
+            ostia_sst_c=ostia_sst_c,
+            title=title,
+            show_legend=True,
+            profile_x_label=profile_x_label,
+            surface_context_label=surface_context_label,
+        )
+        plot_glorys_profile_error_axis(
+            ax[0, 1],
+            x_profile=x_profile,
+            y_hat_profile=y_hat_profile,
+            y_target_profile=y_target_profile,
+            observed_profile=observed_profile,
+            depth_axis=depth_axis,
+            title="Absolute error",
+            show_legend=True,
+            error_x_label=error_x_label,
+        )
+        if figure_title is not None:
+            fig.suptitle(figure_title, fontsize=13)
+            fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+        else:
+            fig.tight_layout()
+        save_kwargs: dict[str, Any] = {}
+        if output_path.suffix.lower() == ".webp":
+            save_kwargs = {
+                "format": "webp",
+                "pil_kwargs": {"quality": int(webp_quality), "method": 6},
+            }
+        fig.savefig(output_path, dpi=int(dpi), **save_kwargs)
+    finally:
+        if fig is not None:
+            plt.close(fig)
+    return output_path
+
+
+def save_average_glorys_profile_error_plot(
+    *,
+    output_path: str | Path,
+    mean_abs_error_prediction_vs_glorys: np.ndarray,
+    mean_abs_error_prediction_vs_argo: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    figure_title: str | None = None,
+    dpi: int = 180,
+) -> Path:
+    """Save one single-panel validation-summary error plot to disk."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = None
+    try:
+        fig, ax = plt.subplots(1, 1, figsize=(5.4, 8.1))
+        plot_average_glorys_profile_error_axis(
+            ax,
+            mean_abs_error_prediction_vs_glorys=mean_abs_error_prediction_vs_glorys,
+            mean_abs_error_prediction_vs_argo=mean_abs_error_prediction_vs_argo,
+            depth_axis=depth_axis,
+            title="Median absolute error",
+            show_legend=True,
+        )
+        if figure_title is not None:
+            fig.suptitle(figure_title, fontsize=13)
+            fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+        else:
+            fig.tight_layout()
+        fig.savefig(output_path, dpi=int(dpi))
+    finally:
+        if fig is not None:
+            plt.close(fig)
+    return output_path
+
+
+def save_average_glorys_profile_and_error_plot(
+    *,
+    output_path: str | Path,
+    mean_argo_profile_c: np.ndarray,
+    mean_prediction_profile_c: np.ndarray,
+    mean_glorys_profile_c: np.ndarray,
+    mean_abs_error_prediction_vs_glorys: np.ndarray,
+    mean_abs_error_prediction_vs_argo: np.ndarray,
+    depth_axis: np.ndarray | None = None,
+    figure_title: str | None = None,
+    dpi: int = 180,
+) -> Path:
+    """Save one two-panel pooled profile/error validation summary plot to disk."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mean_argo_profile_np = np.asarray(mean_argo_profile_c, dtype=np.float64).reshape(-1)
+    mean_prediction_profile_np = np.asarray(
+        mean_prediction_profile_c, dtype=np.float64
+    ).reshape(-1)
+    mean_glorys_profile_np = np.asarray(
+        mean_glorys_profile_c, dtype=np.float64
+    ).reshape(-1)
+    observed_profile_np = np.isfinite(mean_argo_profile_np)
+
+    fig = None
+    try:
+        fig, ax = plt.subplots(
+            1,
+            2,
+            figsize=(10.125, 8.1),
+            squeeze=False,
+            gridspec_kw={"width_ratios": [1.25, 1.0]},
+        )
+        plot_glorys_profile_comparison_axis(
+            ax[0, 0],
+            x_profile=mean_argo_profile_np,
+            y_hat_profile=mean_prediction_profile_np,
+            y_target_profile=mean_glorys_profile_np,
+            observed_profile=observed_profile_np,
+            depth_axis=depth_axis,
+            title="Median profile",
+            show_legend=True,
+        )
+        plot_average_glorys_profile_error_axis(
+            ax[0, 1],
+            mean_abs_error_prediction_vs_glorys=mean_abs_error_prediction_vs_glorys,
+            mean_abs_error_prediction_vs_argo=mean_abs_error_prediction_vs_argo,
+            depth_axis=depth_axis,
+            title="Median absolute error",
+            show_legend=True,
+        )
+        if figure_title is not None:
+            fig.suptitle(figure_title, fontsize=13)
+            fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+        else:
+            fig.tight_layout()
+        fig.savefig(output_path, dpi=int(dpi))
+    finally:
+        if fig is not None:
+            plt.close(fig)
+    return output_path
+
+
+def log_wandb_glorys_profile_comparison(
+    *,
+    logger: Any,
+    x: torch.Tensor,
+    y_hat: torch.Tensor,
+    y_target: torch.Tensor,
+    conditioning_mask: torch.Tensor | None = None,
+    candidate_mask: torch.Tensor | None = None,
+    prefix: str = "val_imgs",
+    image_key: str = "glorys_profile_comparison",
+    sample_idx: int = 0,
+    profile_x_label: str = "Temperature (deg C)",
+) -> None:
+    """Log full-depth profile comparisons at generated-only validation pixels.
+
+    Args:
+        logger (Any): Logger instance used for experiment tracking.
+        x (torch.Tensor): Conditioning tensor containing sparse Argo-aligned profiles.
+        y_hat (torch.Tensor): Reconstructed tensor in denormalized space.
+        y_target (torch.Tensor): GLORYS target tensor in denormalized space.
+        conditioning_mask (torch.Tensor | None): Mask tensor marking known x pixels.
+        candidate_mask (torch.Tensor | None): Mask tensor selecting generated-only pixels.
+        prefix (str): Input value.
+        image_key (str): Input value.
+        sample_idx (int): Zero-based index for selecting a sample or batch.
+        profile_x_label (str): X-axis label for physical profile values.
+
+    Returns:
+        None: No value is returned.
+    """
+    if logger is None or not hasattr(logger, "experiment"):
+        return
+    experiment = logger.experiment
+    if not hasattr(experiment, "log"):
+        return
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    if x.ndim != 4 or y_hat.ndim != 4 or y_target.ndim != 4:
+        return
+    if int(x.size(0)) <= 0 or int(x.size(1)) <= 0:
+        return
+    if x.shape != y_hat.shape or x.shape != y_target.shape:
+        return
+
+    sample_i = int(max(0, min(int(sample_idx), int(x.size(0)) - 1)))
+    candidate_mask_i = _mask_for_sample(candidate_mask, sample_i)
+    conditioning_mask_i = _mask_for_sample(conditioning_mask, sample_i)
+    if candidate_mask_i is None or conditioning_mask_i is None:
+        return
+    if candidate_mask_i.ndim == 3:
+        candidate_map = candidate_mask_i.detach().bool().any(dim=0)
+    elif candidate_mask_i.ndim == 2:
+        candidate_map = candidate_mask_i.detach().bool()
+    else:
+        return
+
+    candidate_coords = torch.nonzero(candidate_map, as_tuple=False)
+    # Skip the plot when no generated-only pixels exist; falling back to known pixels
+    # would make the diagnostic contradict the reconstruction task being visualized.
+    if int(candidate_coords.size(0)) <= 0:
+        return
+
+    num_profiles = min(9, int(candidate_coords.size(0)))
+    # Randomly subsample generated-only locations so the figure covers different profile shapes.
+    chosen = candidate_coords[
+        torch.randperm(int(candidate_coords.size(0)), device=candidate_coords.device)[
+            :num_profiles
+        ]
+    ]
+
+    depth_idx = np.arange(int(y_target.size(1)), dtype=np.int32)
+    fig = None
+    try:
+        fig, axes = plt.subplots(3, 3, figsize=(15.0, 15.0), squeeze=False)
+        axes_flat = axes.reshape(-1)
+        for plot_idx, ax in enumerate(axes_flat):
+            if plot_idx >= num_profiles:
+                ax.set_axis_off()
+                continue
+
+            row_i = int(chosen[plot_idx, 0].item())
+            col_i = int(chosen[plot_idx, 1].item())
+            x_profile = x[sample_i, :, row_i, col_i].detach().float().cpu().numpy()
+            y_hat_profile = (
+                y_hat[sample_i, :, row_i, col_i].detach().float().cpu().numpy()
+            )
+            y_target_profile = (
+                y_target[sample_i, :, row_i, col_i].detach().float().cpu().numpy()
+            )
+            observed_profile = (
+                conditioning_mask_i[:, row_i, col_i].detach().bool().cpu().numpy()
+            )
+            plot_glorys_profile_comparison_axis(
+                ax,
+                x_profile=x_profile,
+                y_hat_profile=y_hat_profile,
+                y_target_profile=y_target_profile,
+                observed_profile=observed_profile,
+                depth_axis=depth_idx,
+                title=f"Pixel ({row_i}, {col_i})",
+                show_legend=(plot_idx == 0),
+                profile_x_label=profile_x_label,
+            )
+
+        fig.suptitle(
+            f"Sample {sample_i} generated-only profile comparisons",
+            fontsize=14,
+        )
+        fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.98])
+        experiment.log({f"{prefix}/{image_key}": wandb.Image(fig)})
+    finally:
+        if fig is not None:
+            plt.close(fig)

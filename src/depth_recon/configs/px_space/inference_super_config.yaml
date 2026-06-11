@@ -1,0 +1,270 @@
+scenario: temperature  # CLI --scenario overrides this default
+
+data:
+  dataset:
+    core:
+      dataset_variant: argo_geotiff_gridded
+      dataloader_type: light
+      geotiff_root_dir: ./data/ocean_depth_reconstruction
+      metadata_cache_dir: ./data/ocean_depth_reconstruction/metadata_cache
+    grid:
+      tile_size: 128
+      resolution_deg: 0.1
+      patch_grid_source: land_mask
+      land_mask_path: masks/world_land_mask_glorys_0p1.tif
+      patch_stride: 32
+      max_land_fraction: 0.3
+      force_include_regions:
+        - name: mediterranean
+          lon_min: -6.0
+          lon_max: 37.0
+          lat_min: 30.0
+          lat_max: 46.0
+          max_land_fraction: 0.6
+        - name: baltic
+          lon_min: 9.0
+          lon_max: 31.0
+          lat_min: 53.0
+          lat_max: 66.0
+          max_land_fraction: 0.85
+        - name: red_sea
+          lon_min: 32.0
+          lon_max: 44.0
+          lat_min: 12.0
+          lat_max: 30.0
+          max_land_fraction: 0.85
+        - name: hudson_bay
+          lon_min: -96.0
+          lon_max: -74.0
+          lat_min: 50.0
+          lat_max: 65.0
+          max_land_fraction: 0.95
+    sampling:
+      temporal_window_days: 7
+      glorys_var_name: thetao
+      ostia_var_name: analysed_sst
+      eo_source: ostia
+      eo_var_name: analysed_sst
+    selection:
+      require_argo_for_train: false
+      require_argo_for_val: true
+      require_argo_for_all: false
+    synthetic:
+      enabled: false
+      pixel_count: 250
+    finetune_sampling:
+      enabled: false
+      hard_fraction: 0.75
+      apply_to_splits: [train]
+      relax_land_filter: true
+      default_max_land_fraction: 0.85
+      hard_regions:
+        - name: mediterranean
+          lon_min: -6.0
+          lon_max: 37.0
+          lat_min: 30.0
+          lat_max: 46.0
+        - name: black_sea
+          lon_min: 27.0
+          lon_max: 42.0
+          lat_min: 40.0
+          lat_max: 47.0
+        - name: russian_arctic_west
+          lon_min: 20.0
+          lon_max: 180.0
+          lat_min: 66.0
+          lat_max: 82.0
+        - name: russian_arctic_east
+          lon_min: -180.0
+          lon_max: -160.0
+          lat_min: 66.0
+          lat_max: 82.0
+        - name: hudson_bay
+          lon_min: -96.0
+          lon_max: -74.0
+          lat_min: 50.0
+          lat_max: 65.0
+        - name: baja_california
+          lon_min: -122.0
+          lon_max: -104.0
+          lat_min: 18.0
+          lat_max: 33.0
+        - name: greenland
+          lon_min: -75.0
+          lon_max: -10.0
+          lat_min: 58.0
+          lat_max: 84.0
+        - name: svalbard_barents
+          lon_min: 0.0
+          lon_max: 45.0
+          lat_min: 70.0
+          lat_max: 82.0
+        - name: european_atlantic
+          lon_min: -16.0
+          lon_max: 16.0
+          lat_min: 35.0
+          lat_max: 70.0
+        - name: persian_gulf
+          lon_min: 47.0
+          lon_max: 57.0
+          lat_min: 23.0
+          lat_max: 31.0
+        - name: red_sea
+          lon_min: 32.0
+          lon_max: 44.0
+          lat_min: 12.0
+          lat_max: 30.0
+        - name: yellow_sea
+          lon_min: 117.0
+          lon_max: 127.0
+          lat_min: 31.0
+          lat_max: 41.0
+        - name: sea_of_japan
+          lon_min: 127.0
+          lon_max: 142.0
+          lat_min: 34.0
+          lat_max: 52.0
+        - name: sea_of_okhotsk
+          lon_min: 140.0
+          lon_max: 164.0
+          lat_min: 43.0
+          lat_max: 62.0
+        - name: northern_alaska
+          lon_min: -170.0
+          lon_max: -135.0
+          lat_min: 68.0
+          lat_max: 75.0
+        - name: bay_of_benin_west
+          lon_min: -1.5
+          lon_max: 1.5
+          lat_min: 4.8
+          lat_max: 6.8
+        - name: bay_of_benin_east
+          lon_min: 1.5
+          lon_max: 4.5
+          lat_min: 4.2
+          lat_max: 6.8
+        - name: new_york_nova_scotia
+          lon_min: -75.0
+          lon_max: -59.0
+          lat_min: 40.0
+          lat_max: 47.0
+    output:
+      return_info: false
+      return_coords: true
+    runtime:
+      random_seed: 7
+      cache_size: 8
+  split:
+    val_year: 2018
+    val_fraction: 0.2
+  dataloader:
+    num_workers: 6
+    prefetch_factor: 2
+    val_shuffle: true  # keep validation loader shuffled
+
+model:
+  model_type: unet_baseline
+  depth_channels: 50
+  resume_checkpoint: false
+  load_checkpoint_only: false
+  condition_mask_channels: 1
+  condition_include_eo: true
+  condition_use_valid_mask: true
+  condition_use_land_mask: true
+  idw:
+    power: 2.0
+    eps: 1.0e-6
+    chunk_size: 4096
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.0
+    bidirectional: true
+    lr: null
+    weight_decay: 0.0
+    include_eo: true
+  unet_baseline:
+    base_channels: 32
+    channel_mults: [1, 2, 4, 8]
+    norm_groups: 8
+    dropout: 0.0
+    lr: null
+    weight_decay: 0.0001
+    per_channel_valid_mask: true
+
+training:
+  training:
+    lr: 0.0001
+    batch_size: 4
+    validation_sampling:
+      skip_full_reconstruction_in_sanity_check: true
+      max_full_reconstruction_samples: 5
+  trainer:
+    max_epochs: 100
+    accelerator: auto
+    devices: auto
+    num_gpus: null
+    strategy: auto
+    precision: 16-mixed
+    matmul_precision: high
+    suppress_accumulate_grad_stream_mismatch_warning: true
+    suppress_lightning_pytree_warning: true
+    ckpt_monitor: val/loss_ckpt
+    lr_logging_interval: step
+    log_every_n_steps: 25
+    num_sanity_val_steps: 1
+    val_check_interval: 1.0
+    limit_val_batches: 1.0
+    enable_model_summary: true
+    gradient_clip_val: 1.0
+  wandb:
+    project: ocean-depth-reconstruction
+    entity: null
+    run_name: baseline_training
+    log_model: 'false'
+    verbose: true
+    watch_gradients: false
+    watch_parameters: false
+    watch_log_freq: 100
+    watch_log_graph: false
+    log_stats_every_n_steps: 200
+    log_images_every_n_steps: 200
+  dataloader:
+    batch_size: 4
+    val_batch_size: 2
+    num_workers: 6
+    val_num_workers: 0
+    persistent_workers: true
+    val_persistent_workers: false
+    prefetch_factor: 2
+    shuffle: true
+    val_shuffle: true  # keep validation loader shuffled
+    pin_memory: true
+  scheduler:
+    warmup:
+      enabled: false
+      steps: 2000
+      start_ratio: 0.2
+    reduce_on_plateau:
+      enabled: true
+      monitor: val/loss_ckpt
+      interval: step
+      mode: min
+      factor: 0.5
+      patience: 25000
+      threshold: 0.0001
+      threshold_mode: rel
+      cooldown: 0
+      min_lr: 1.0e-06
+      eps: 1.0e-08
+
+inference:
+  dataloader:
+    batch_size: 64
+    num_workers: 6
+    prefetch_factor: 2
+  grid:
+    patch_stride: 96
+    min_ocean_fraction: 0.05
+    land_mask_path: masks/world_land_mask_glorys_0p1.tif
